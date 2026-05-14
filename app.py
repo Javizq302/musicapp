@@ -1,5 +1,6 @@
 import os
 import io
+import json
 import zipfile
 import shutil
 import tempfile
@@ -23,11 +24,24 @@ MIME_TYPES = {
 }
 
 ICONS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "icons")
+CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
 
 
 def load_icon(name, size):
     path = os.path.join(ICONS_DIR, f"{name}.png")
     return ctk.CTkImage(Image.open(path), size=(size, size))
+
+
+def load_config():
+    if os.path.exists(CONFIG_PATH):
+        with open(CONFIG_PATH) as f:
+            return json.load(f)
+    return {}
+
+
+def save_config(data):
+    with open(CONFIG_PATH, "w") as f:
+        json.dump(data, f, indent=2)
 
 
 # --- Core functions ---
@@ -70,12 +84,14 @@ def analyze_zip(zip_path):
                 image_data = f.read()
 
         track_names = [os.path.splitext(os.path.basename(a))[0] for a in audios]
+        track_files = [os.path.basename(a) for a in audios]
 
         return {
             "zip_path": zip_path,
             "zip_name": zip_name,
             "image_data": image_data,
             "track_names": track_names,
+            "track_files": track_files,
             "has_cover": image_data is not None,
             "track_count": len(audios),
         }
@@ -112,8 +128,9 @@ def embed_cover_mp3(audio_path, image_data, mime_type):
     audio.save()
 
 
-def process_zip(zip_path, output_dir, log_callback=None):
+def process_zip(zip_path, output_dir, skip_files=None):
     zip_name = os.path.splitext(os.path.basename(zip_path))[0]
+    skip = skip_files or set()
 
     with tempfile.TemporaryDirectory() as tmp_dir:
         with zipfile.ZipFile(zip_path, "r") as zf:
@@ -129,10 +146,11 @@ def process_zip(zip_path, output_dir, log_callback=None):
                         image = image or img
                         audios.extend(auds)
 
+        # Filter out skipped tracks
+        audios = [a for a in audios if os.path.basename(a) not in skip]
+
         if not image or not audios:
-            if log_callback:
-                log_callback(f"  SKIP  {zip_name}")
-            return False
+            return 0
 
         image_ext = os.path.splitext(image)[1].lower()
         mime_type = MIME_TYPES.get(image_ext, "image/jpeg")
@@ -149,10 +167,7 @@ def process_zip(zip_path, output_dir, log_callback=None):
             dest = os.path.join(output_dir, os.path.basename(audio_path))
             shutil.copy2(audio_path, dest)
 
-        count = len(audios)
-        if log_callback:
-            log_callback(f"  OK    {zip_name} — {count} track{'s' if count > 1 else ''}")
-        return True
+        return len(audios)
 
 
 def make_rounded_thumb(image_data, size=50, radius=12):
@@ -188,11 +203,12 @@ SPINNER_FRAMES = ["\u25DC", "\u25DD", "\u25DE", "\u25DF"]
 
 
 class FolderSelector(ctk.CTkFrame):
-    def __init__(self, master, icon_img, label, dialog_title):
+    def __init__(self, master, icon_img, label, dialog_title, on_change=None):
         super().__init__(master, fg_color=SURFACE, corner_radius=14,
                          border_width=1, border_color=SURFACE_2)
         self.dialog_title = dialog_title
         self.path = ""
+        self.on_change = on_change
 
         content = ctk.CTkFrame(self, fg_color="transparent")
         content.pack(fill="x", padx=18, pady=14)
@@ -227,24 +243,42 @@ class FolderSelector(ctk.CTkFrame):
         )
         self.btn.pack(side="right")
 
-    def browse(self):
-        path = filedialog.askdirectory(title=self.dialog_title)
-        if path:
+    def set_path(self, path):
+        if path and os.path.isdir(path):
             self.path = path
             display = path if len(path) < 50 else "..." + path[-47:]
             self.path_label.configure(text=display, text_color=TEXT_SEC)
 
+    def browse(self):
+        path = filedialog.askdirectory(title=self.dialog_title)
+        if path:
+            self.set_path(path)
+            if self.on_change:
+                self.on_change(path)
+
 
 class TrackRow(ctk.CTkFrame):
-    def __init__(self, master, track_name, subtitle, cover_image=None, hp_icon=None):
+    def __init__(self, master, track_name, track_file, subtitle, cover_image=None, hp_icon=None):
         super().__init__(master, fg_color=SURFACE, corner_radius=12, height=64,
                          border_width=1, border_color=SURFACE_2)
         self.pack_propagate(False)
 
         self._photo = None
+        self.track_file = track_file
 
         row = ctk.CTkFrame(self, fg_color="transparent")
         row.pack(fill="x", padx=14, pady=7)
+
+        # Checkbox
+        self.selected = ctk.BooleanVar(value=True)
+        self.checkbox = ctk.CTkCheckBox(
+            row, text="", variable=self.selected,
+            width=24, height=24, corner_radius=6,
+            fg_color=PURPLE, hover_color=PURPLE_HOVER,
+            border_color=SURFACE_3, border_width=2,
+            command=self._on_toggle,
+        )
+        self.checkbox.pack(side="left", padx=(0, 10))
 
         if cover_image:
             self._photo = make_rounded_thumb(cover_image, THUMB_SIZE, 12)
@@ -259,18 +293,28 @@ class TrackRow(ctk.CTkFrame):
         info = ctk.CTkFrame(row, fg_color="transparent")
         info.pack(side="left", fill="x", expand=True)
 
-        ctk.CTkLabel(
+        self.name_label = ctk.CTkLabel(
             info, text=track_name,
             font=("SF Pro Text", 13, "bold"), text_color=TEXT, anchor="w",
-        ).pack(anchor="w")
+        )
+        self.name_label.pack(anchor="w")
 
-        ctk.CTkLabel(
+        self.sub_label = ctk.CTkLabel(
             info, text=subtitle,
             font=("SF Pro Text", 11), text_color=TEXT_TER, anchor="w",
-        ).pack(anchor="w", pady=(2, 0))
+        )
+        self.sub_label.pack(anchor="w", pady=(2, 0))
 
         if hp_icon:
             ctk.CTkLabel(row, text="", image=hp_icon).pack(side="right", padx=(8, 4))
+
+    def _on_toggle(self):
+        if self.selected.get():
+            self.name_label.configure(text_color=TEXT)
+            self.sub_label.configure(text_color=TEXT_TER)
+        else:
+            self.name_label.configure(text_color=TEXT_TER)
+            self.sub_label.configure(text_color=SURFACE_3)
 
 
 class App(ctk.CTk):
@@ -281,10 +325,14 @@ class App(ctk.CTk):
         self.minsize(580, 500)
 
         self.analyzed_data = []
+        self.track_rows = []
         self._spinner_running = False
         self._spinner_index = 0
         self._spinner_text = ""
         self._spinner_after_id = None
+
+        # Load saved config
+        self._config = load_config()
 
         # Load icons
         self._icon_disc = load_icon("disc-3-purple", 28)
@@ -324,11 +372,23 @@ class App(ctk.CTk):
         selectors = ctk.CTkFrame(self, fg_color="transparent")
         selectors.pack(fill="x", padx=36, pady=(24, 0))
 
-        self.input_sel = FolderSelector(selectors, self._icon_folder, "ZIP Folder", "Select folder with ZIPs")
+        self.input_sel = FolderSelector(
+            selectors, self._icon_folder, "ZIP Folder",
+            "Select folder with ZIPs", on_change=self._on_input_change,
+        )
         self.input_sel.pack(fill="x", pady=(0, 8))
 
-        self.output_sel = FolderSelector(selectors, self._icon_sparkle, "Output Folder", "Select output folder")
+        self.output_sel = FolderSelector(
+            selectors, self._icon_sparkle, "Output Folder",
+            "Select output folder", on_change=self._on_output_change,
+        )
         self.output_sel.pack(fill="x")
+
+        # Restore saved paths
+        if self._config.get("input_dir"):
+            self.input_sel.set_path(self._config["input_dir"])
+        if self._config.get("output_dir"):
+            self.output_sel.set_path(self._config["output_dir"])
 
         # --- Action bar ---
         action_bar = ctk.CTkFrame(self, fg_color="transparent")
@@ -389,17 +449,50 @@ class App(ctk.CTk):
             font=("SF Pro Text", 12, "bold"), text_color=TEXT_SEC,
         ).pack(side="left")
 
+        th_right = ctk.CTkFrame(list_header, fg_color="transparent")
+        th_right.pack(side="right")
+
         self.track_count_label = ctk.CTkLabel(
-            list_header, text="",
+            th_right, text="",
             font=("SF Pro Text", 12), text_color=TEXT_TER,
         )
-        self.track_count_label.pack(side="right")
+        self.track_count_label.pack(side="left", padx=(0, 12))
+
+        self.btn_select_all = ctk.CTkButton(
+            th_right, text="All", width=40, height=24,
+            font=("SF Pro Text", 11), fg_color=SURFACE_2,
+            hover_color=SURFACE_3, text_color=TEXT_SEC,
+            corner_radius=6, command=lambda: self._set_all_tracks(True),
+        )
+
+        self.btn_select_none = ctk.CTkButton(
+            th_right, text="None", width=44, height=24,
+            font=("SF Pro Text", 11), fg_color=SURFACE_2,
+            hover_color=SURFACE_3, text_color=TEXT_SEC,
+            corner_radius=6, command=lambda: self._set_all_tracks(False),
+        )
 
         # --- Scrollable track list ---
         self.preview_frame = ctk.CTkScrollableFrame(
             self, fg_color="transparent", corner_radius=0,
         )
         self.preview_frame.pack(fill="both", expand=True, padx=36, pady=(8, 12))
+
+        # Fix trackpad scrolling on macOS
+        # CTkScrollableFrame uses _mouse_wheel_all internally
+        # Override it to ensure proper scroll behavior
+        canvas = self.preview_frame._parent_canvas
+        canvas.configure(yscrollincrement=1)
+
+        def _scroll_override(event):
+            if canvas.yview() == (0.0, 1.0):
+                return
+            canvas.yview_scroll(-event.delta, "units")
+
+        # Replace the internal handler
+        self.preview_frame._mouse_wheel_all = _scroll_override
+        self.unbind_all("<MouseWheel>")
+        self.bind_all("<MouseWheel>", _scroll_override)
 
         # Empty state
         empty = ctk.CTkFrame(self.preview_frame, fg_color=SURFACE, corner_radius=16, height=140)
@@ -419,6 +512,20 @@ class App(ctk.CTk):
         footer = ctk.CTkFrame(self, fg_color="transparent")
         footer.pack(pady=(0, 16))
 
+    # --- Config persistence ---
+    def _on_input_change(self, path):
+        self._config["input_dir"] = path
+        save_config(self._config)
+
+    def _on_output_change(self, path):
+        self._config["output_dir"] = path
+        save_config(self._config)
+
+    # --- Select all/none ---
+    def _set_all_tracks(self, state):
+        for row in self.track_rows:
+            row.selected.set(state)
+            row._on_toggle()
 
     # --- Spinner ---
     def start_spinner(self, text):
@@ -449,6 +556,7 @@ class App(ctk.CTk):
     def clear_preview(self):
         for widget in self.preview_frame.winfo_children():
             widget.destroy()
+        self.track_rows = []
 
     def start_analyze(self):
         input_dir = self.input_sel.path
@@ -462,6 +570,8 @@ class App(ctk.CTk):
         self.clear_preview()
         self.analyzed_data = []
         self.track_count_label.configure(text="")
+        self.btn_select_all.pack_forget()
+        self.btn_select_none.pack_forget()
         self.start_spinner("Scanning ZIPs...")
 
         Thread(target=self.run_analyze, args=(input_dir,), daemon=True).start()
@@ -488,6 +598,7 @@ class App(ctk.CTk):
                     "zip_name": os.path.splitext(zip_name)[0],
                     "image_data": None,
                     "track_names": [],
+                    "track_files": [],
                     "has_cover": False,
                     "track_count": 0,
                     "error": str(e),
@@ -504,16 +615,32 @@ class App(ctk.CTk):
         for info in results:
             cover = info["image_data"]
             if not info["track_names"]:
-                TrackRow(self.preview_frame, info["zip_name"], "No tracks found", cover, self._icon_hp).pack(fill="x", pady=(0, 6))
+                tr = TrackRow(self.preview_frame, info["zip_name"], "", "No tracks found", cover, self._icon_hp)
+                tr.pack(fill="x", pady=(0, 6))
+                self.track_rows.append(tr)
                 continue
-            for name in info["track_names"]:
-                TrackRow(self.preview_frame, name, info["zip_name"], cover, self._icon_hp).pack(fill="x", pady=(0, 6))
+            for name, fname in zip(info["track_names"], info["track_files"]):
+                tr = TrackRow(self.preview_frame, name, fname, info["zip_name"], cover, self._icon_hp)
+                tr.pack(fill="x", pady=(0, 6))
+                self.track_rows.append(tr)
                 total_tracks += 1
 
         self.track_count_label.configure(text=f"{total_tracks} track{'s' if total_tracks != 1 else ''}")
+        # Show select all/none buttons
+        self.btn_select_all.pack(side="left", padx=(0, 4))
+        self.btn_select_none.pack(side="left")
+
         self.stop_spinner(f"{total_tracks} tracks ready!")
         self.btn_analyze.configure(state="normal")
         self.btn_process.configure(state="normal", fg_color=PINK, hover_color="#f472b6", text_color="#ffffff")
+
+    def _get_skip_files(self):
+        """Build a set of filenames to skip based on unchecked tracks."""
+        skip = set()
+        for row in self.track_rows:
+            if not row.selected.get() and row.track_file:
+                skip.add(row.track_file)
+        return skip
 
     def start_processing(self):
         output_dir = self.output_sel.path
@@ -524,29 +651,34 @@ class App(ctk.CTk):
             self.status.configure(text="Analyze first!", text_color=RED)
             return
 
+        skip_files = self._get_skip_files()
+        selected_count = sum(1 for r in self.track_rows if r.selected.get() and r.track_file)
+        if selected_count == 0:
+            self.status.configure(text="No tracks selected!", text_color=RED)
+            return
+
         self.btn_analyze.configure(state="disabled")
         self.btn_process.configure(state="disabled")
         self.progress.set(0)
-        self.start_spinner("Embedding covers...")
+        self.start_spinner(f"Embedding {selected_count} tracks...")
 
-        Thread(target=self.run_process, args=(output_dir,), daemon=True).start()
+        Thread(target=self.run_process, args=(output_dir, skip_files), daemon=True).start()
 
-    def run_process(self, output_dir):
+    def run_process(self, output_dir, skip_files):
         total = len(self.analyzed_data)
-        ok_count = 0
+        total_tracks = 0
 
         for i, info in enumerate(self.analyzed_data, 1):
             zip_path = info["zip_path"]
             try:
-                success = process_zip(zip_path, output_dir)
-                if success:
-                    ok_count += 1
+                count = process_zip(zip_path, output_dir, skip_files=skip_files)
+                total_tracks += count
             except Exception:
                 pass
 
             self.after(0, lambda v=i / total: self.progress.set(v))
 
-        self.after(0, lambda: self.stop_spinner(f"Done! {ok_count}/{total} ZIPs processed"))
+        self.after(0, lambda: self.stop_spinner(f"Done! {total_tracks} tracks processed"))
         self.after(0, lambda: self.btn_analyze.configure(state="normal"))
         self.after(0, lambda: self.btn_process.configure(state="normal"))
 
