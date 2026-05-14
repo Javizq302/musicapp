@@ -1,0 +1,3 @@
+([('MusicCoverEmbedder',
+   '/Users/angelizquierdo/Documents/Apps/music/dist/MusicCoverEmbedder',
+   'EXECUTABLE')],)
