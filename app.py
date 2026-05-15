@@ -4,6 +4,7 @@ import json
 import zipfile
 import shutil
 import tempfile
+import tkinter as tk
 from tkinter import filedialog
 from threading import Thread
 
@@ -257,64 +258,78 @@ class FolderSelector(ctk.CTkFrame):
                 self.on_change(path)
 
 
-class TrackRow(ctk.CTkFrame):
-    def __init__(self, master, track_name, track_file, subtitle, cover_image=None, hp_icon=None):
-        super().__init__(master, fg_color=SURFACE, corner_radius=12, height=64,
-                         border_width=1, border_color=SURFACE_2)
-        self.pack_propagate(False)
+CB_CHECKED = " \u2611 "
+CB_UNCHECKED = " \u2610 "
 
-        self._photo = None
-        self.track_file = track_file
 
-        row = ctk.CTkFrame(self, fg_color="transparent")
-        row.pack(fill="x", padx=14, pady=7)
+class DarkScrollbar(tk.Canvas):
+    """Minimal custom scrollbar matching the dark theme."""
 
-        # Checkbox
-        self.selected = ctk.BooleanVar(value=True)
-        self.checkbox = ctk.CTkCheckBox(
-            row, text="", variable=self.selected,
-            width=24, height=24, corner_radius=6,
-            fg_color=PURPLE, hover_color=PURPLE_HOVER,
-            border_color=SURFACE_3, border_width=2,
-            command=self._on_toggle,
-        )
-        self.checkbox.pack(side="left", padx=(0, 10))
+    def __init__(self, master, command=None, **kw):
+        super().__init__(master, width=8, bg=BG, highlightthickness=0,
+                         borderwidth=0, **kw)
+        self._command = command
+        self._first = 0.0
+        self._last = 1.0
+        self._drag_y = None
 
-        if cover_image:
-            self._photo = make_rounded_thumb(cover_image, THUMB_SIZE, 12)
-            ctk.CTkLabel(row, image=self._photo, text="").pack(side="left", padx=(0, 14))
+        self.bind("<Button-1>", self._on_click)
+        self.bind("<B1-Motion>", self._on_drag)
+        self.bind("<ButtonRelease-1>", self._on_release)
+        self.bind("<Configure>", lambda e: self._draw())
+
+    def set(self, first, last):
+        self._first = float(first)
+        self._last = float(last)
+        self._draw()
+
+    def _draw(self):
+        self.delete("all")
+        h = self.winfo_height()
+        if h < 1 or self._first <= 0 and self._last >= 1:
+            return
+        y1 = max(int(self._first * h), 2)
+        y2 = min(int(self._last * h), h - 2)
+        if y2 - y1 < 16:
+            y2 = y1 + 16
+        self.create_rounded_rect(2, y1, 6, y2, radius=3, fill=SURFACE_3)
+
+    def create_rounded_rect(self, x1, y1, x2, y2, radius, **kw):
+        r = min(radius, (x2 - x1) // 2, (y2 - y1) // 2)
+        self.create_oval(x1, y1, x1 + 2 * r, y1 + 2 * r, outline="", **kw)
+        self.create_oval(x1, y2 - 2 * r, x1 + 2 * r, y2, outline="", **kw)
+        self.create_rectangle(x1, y1 + r, x2, y2 - r, outline="", **kw)
+
+    def _on_click(self, event):
+        h = self.winfo_height()
+        if h < 1:
+            return
+        frac = event.y / h
+        thumb_mid = (self._first + self._last) / 2
+        thumb_h = self._last - self._first
+        y1 = self._first * h
+        y2 = self._last * h
+        if y1 <= event.y <= y2:
+            self._drag_y = event.y
         else:
-            ph = ctk.CTkFrame(row, width=THUMB_SIZE, height=THUMB_SIZE, fg_color=SURFACE_3, corner_radius=12)
-            ph.pack(side="left", padx=(0, 14))
-            ph.pack_propagate(False)
-            if hp_icon:
-                ctk.CTkLabel(ph, text="", image=load_icon("music-dim", 24)).place(relx=0.5, rely=0.5, anchor="center")
+            if self._command:
+                self._command("moveto", str(frac - thumb_h / 2))
 
-        info = ctk.CTkFrame(row, fg_color="transparent")
-        info.pack(side="left", fill="x", expand=True)
+    def _on_drag(self, event):
+        if self._drag_y is None:
+            return
+        h = self.winfo_height()
+        if h < 1:
+            return
+        dy = event.y - self._drag_y
+        self._drag_y = event.y
+        delta = dy / h
+        new_first = self._first + delta
+        if self._command:
+            self._command("moveto", str(max(0, new_first)))
 
-        self.name_label = ctk.CTkLabel(
-            info, text=track_name,
-            font=("SF Pro Text", 13, "bold"), text_color=TEXT, anchor="w",
-        )
-        self.name_label.pack(anchor="w")
-
-        self.sub_label = ctk.CTkLabel(
-            info, text=subtitle,
-            font=("SF Pro Text", 11), text_color=TEXT_TER, anchor="w",
-        )
-        self.sub_label.pack(anchor="w", pady=(2, 0))
-
-        if hp_icon:
-            ctk.CTkLabel(row, text="", image=hp_icon).pack(side="right", padx=(8, 4))
-
-    def _on_toggle(self):
-        if self.selected.get():
-            self.name_label.configure(text_color=TEXT)
-            self.sub_label.configure(text_color=TEXT_TER)
-        else:
-            self.name_label.configure(text_color=TEXT_TER)
-            self.sub_label.configure(text_color=SURFACE_3)
+    def _on_release(self, event):
+        self._drag_y = None
 
 
 class App(ctk.CTk):
@@ -325,7 +340,8 @@ class App(ctk.CTk):
         self.minsize(580, 500)
 
         self.analyzed_data = []
-        self.track_rows = []
+        self._track_data = []
+        self._thumbs = []
         self._spinner_running = False
         self._spinner_index = 0
         self._spinner_text = ""
@@ -472,41 +488,34 @@ class App(ctk.CTk):
             corner_radius=6, command=lambda: self._set_all_tracks(False),
         )
 
-        # --- Scrollable track list ---
-        self.preview_frame = ctk.CTkScrollableFrame(
-            self, fg_color="transparent", corner_radius=0,
+        # --- Scrollable track list (tk.Text for native macOS trackpad scroll) ---
+        text_frame = tk.Frame(self, bg=BG)
+        text_frame.pack(fill="both", expand=True, padx=36, pady=(8, 12))
+
+        self._scrollbar = DarkScrollbar(text_frame)
+        self._scrollbar.pack(side="right", fill="y", padx=(4, 0))
+
+        self._scroll_text = tk.Text(
+            text_frame, bg=BG, highlightthickness=0, borderwidth=0,
+            cursor="arrow", wrap="word", spacing1=0, spacing3=0,
+            padx=4, pady=4, yscrollcommand=self._scrollbar.set,
         )
-        self.preview_frame.pack(fill="both", expand=True, padx=36, pady=(8, 12))
+        self._scroll_text.pack(side="left", fill="both", expand=True)
+        self._scrollbar._command = self._scroll_text.yview
+        self._scroll_text.configure(state="disabled")
 
-        # Fix trackpad scrolling on macOS
-        # CTkScrollableFrame uses _mouse_wheel_all internally
-        # Override it to ensure proper scroll behavior
-        canvas = self.preview_frame._parent_canvas
-        canvas.configure(yscrollincrement=1)
-
-        def _scroll_override(event):
-            if canvas.yview() == (0.0, 1.0):
-                return
-            canvas.yview_scroll(-event.delta, "units")
-
-        # Replace the internal handler
-        self.preview_frame._mouse_wheel_all = _scroll_override
-        self.unbind_all("<MouseWheel>")
-        self.bind_all("<MouseWheel>", _scroll_override)
+        # Configure text tags for track rendering
+        self._scroll_text.tag_configure("cb_on", foreground=PURPLE, font=("SF Pro Text", 16))
+        self._scroll_text.tag_configure("cb_off", foreground=TEXT_TER, font=("SF Pro Text", 16))
+        self._scroll_text.tag_configure("track_name", foreground=TEXT, font=("SF Pro Text", 13, "bold"))
+        self._scroll_text.tag_configure("track_name_dim", foreground=TEXT_TER, font=("SF Pro Text", 13, "bold"))
+        self._scroll_text.tag_configure("track_sub", foreground=TEXT_TER, font=("SF Pro Text", 11))
+        self._scroll_text.tag_configure("track_sub_dim", foreground=SURFACE_3, font=("SF Pro Text", 11))
+        self._scroll_text.tag_configure("spacer", font=("SF Pro Text", 6))
+        self._scroll_text.tag_configure("empty_msg", foreground=TEXT_TER, font=("SF Pro Text", 13), justify="center")
 
         # Empty state
-        empty = ctk.CTkFrame(self.preview_frame, fg_color=SURFACE, corner_radius=16, height=140)
-        empty.pack(fill="x", pady=8)
-        empty.pack_propagate(False)
-
-        ctk.CTkLabel(
-            empty, text="", image=load_icon("music-sec", 28),
-        ).place(relx=0.5, rely=0.35, anchor="center")
-
-        ctk.CTkLabel(
-            empty, text="No tracks yet — hit Analyze to get started!",
-            font=("SF Pro Text", 13), text_color=TEXT_TER,
-        ).place(relx=0.5, rely=0.65, anchor="center")
+        self._show_empty_state()
 
         # --- Footer ---
         footer = ctk.CTkFrame(self, fg_color="transparent")
@@ -523,9 +532,9 @@ class App(ctk.CTk):
 
     # --- Select all/none ---
     def _set_all_tracks(self, state):
-        for row in self.track_rows:
-            row.selected.set(state)
-            row._on_toggle()
+        for i, td in enumerate(self._track_data):
+            td["selected"] = state
+            self._update_track_visual(i)
 
     # --- Spinner ---
     def start_spinner(self, text):
@@ -553,10 +562,56 @@ class App(ctk.CTk):
             self.status.configure(text=f"ok  {done_text}", text_color=GREEN)
 
     # --- Preview ---
+    def _show_empty_state(self):
+        self._scroll_text.configure(state="normal")
+        self._scroll_text.insert("end", "\n\n\n")
+        self._scroll_text.insert("end", "No tracks yet — hit Analyze to get started!", ("empty_msg",))
+        self._scroll_text.configure(state="disabled")
+
     def clear_preview(self):
-        for widget in self.preview_frame.winfo_children():
-            widget.destroy()
-        self.track_rows = []
+        self._scroll_text.configure(state="normal")
+        self._scroll_text.delete("1.0", "end")
+        self._scroll_text.configure(state="disabled")
+        self._track_data = []
+        self._thumbs = []
+
+    def _toggle_track(self, idx):
+        td = self._track_data[idx]
+        td["selected"] = not td["selected"]
+        self._update_track_visual(idx)
+
+    def _update_track_visual(self, idx):
+        td = self._track_data[idx]
+        selected = td["selected"]
+        cb_tag = f"cb_{idx}"
+        name_tag = f"name_{idx}"
+        sub_tag = f"sub_{idx}"
+        self._scroll_text.configure(state="normal")
+
+        # Update checkbox text
+        r = self._scroll_text.tag_ranges(cb_tag)
+        if r:
+            self._scroll_text.delete(r[0], r[1])
+            cb_text = CB_CHECKED if selected else CB_UNCHECKED
+            style = "cb_on" if selected else "cb_off"
+            self._scroll_text.insert(r[0], cb_text, (cb_tag, style))
+            self._scroll_text.tag_bind(cb_tag, "<Button-1>", lambda e, i=idx: self._toggle_track(i))
+
+        # Update name style
+        r = self._scroll_text.tag_ranges(name_tag)
+        if r:
+            self._scroll_text.tag_remove("track_name", r[0], r[1])
+            self._scroll_text.tag_remove("track_name_dim", r[0], r[1])
+            self._scroll_text.tag_add("track_name" if selected else "track_name_dim", r[0], r[1])
+
+        # Update sub style
+        r = self._scroll_text.tag_ranges(sub_tag)
+        if r:
+            self._scroll_text.tag_remove("track_sub", r[0], r[1])
+            self._scroll_text.tag_remove("track_sub_dim", r[0], r[1])
+            self._scroll_text.tag_add("track_sub" if selected else "track_sub_dim", r[0], r[1])
+
+        self._scroll_text.configure(state="disabled")
 
     def start_analyze(self):
         input_dir = self.input_sel.path
@@ -610,23 +665,51 @@ class App(ctk.CTk):
 
     def show_preview(self, results):
         self.clear_preview()
+        self._scroll_text.configure(state="normal")
 
         total_tracks = 0
         for info in results:
-            cover = info["image_data"]
+            cover_data = info["image_data"]
             if not info["track_names"]:
-                tr = TrackRow(self.preview_frame, info["zip_name"], "", "No tracks found", cover, self._icon_hp)
-                tr.pack(fill="x", pady=(0, 6))
-                self.track_rows.append(tr)
                 continue
             for name, fname in zip(info["track_names"], info["track_files"]):
-                tr = TrackRow(self.preview_frame, name, fname, info["zip_name"], cover, self._icon_hp)
-                tr.pack(fill="x", pady=(0, 6))
-                self.track_rows.append(tr)
+                tid = total_tracks
+                cb_tag = f"cb_{tid}"
+                name_tag = f"name_{tid}"
+                sub_tag = f"sub_{tid}"
+
+                self._track_data.append({
+                    "name": name,
+                    "file": fname,
+                    "zip_name": info["zip_name"],
+                    "selected": True,
+                })
+
+                # Checkbox
+                self._scroll_text.insert("end", CB_CHECKED, (cb_tag, "cb_on"))
+                self._scroll_text.tag_bind(cb_tag, "<Button-1>", lambda e, i=tid: self._toggle_track(i))
+
+                # Cover thumbnail
+                if cover_data:
+                    thumb = make_rounded_thumb(cover_data, 40, 10)
+                    self._thumbs.append(thumb)
+                    self._scroll_text.image_create("end", image=thumb, padx=6)
+
+                # Track name
+                self._scroll_text.insert("end", f" {name}\n", (name_tag, "track_name"))
+
+                # Subtitle (zip name) — indented to align past checkbox + cover
+                indent = "          " if cover_data else "      "
+                self._scroll_text.insert("end", f"{indent}{info['zip_name']}\n", (sub_tag, "track_sub"))
+
+                # Spacer line
+                self._scroll_text.insert("end", "\n", ("spacer",))
+
                 total_tracks += 1
 
+        self._scroll_text.configure(state="disabled")
+
         self.track_count_label.configure(text=f"{total_tracks} track{'s' if total_tracks != 1 else ''}")
-        # Show select all/none buttons
         self.btn_select_all.pack(side="left", padx=(0, 4))
         self.btn_select_none.pack(side="left")
 
@@ -635,11 +718,10 @@ class App(ctk.CTk):
         self.btn_process.configure(state="normal", fg_color=PINK, hover_color="#f472b6", text_color="#ffffff")
 
     def _get_skip_files(self):
-        """Build a set of filenames to skip based on unchecked tracks."""
         skip = set()
-        for row in self.track_rows:
-            if not row.selected.get() and row.track_file:
-                skip.add(row.track_file)
+        for td in self._track_data:
+            if not td["selected"] and td["file"]:
+                skip.add(td["file"])
         return skip
 
     def start_processing(self):
@@ -652,7 +734,7 @@ class App(ctk.CTk):
             return
 
         skip_files = self._get_skip_files()
-        selected_count = sum(1 for r in self.track_rows if r.selected.get() and r.track_file)
+        selected_count = sum(1 for td in self._track_data if td["selected"] and td["file"])
         if selected_count == 0:
             self.status.configure(text="No tracks selected!", text_color=RED)
             return
