@@ -4,6 +4,7 @@ import json
 import zipfile
 import shutil
 import tempfile
+import subprocess
 import tkinter as tk
 from tkinter import filedialog
 from threading import Thread
@@ -342,6 +343,9 @@ class App(ctk.CTk):
         self.analyzed_data = []
         self._track_data = []
         self._thumbs = []
+        self._player_proc = None
+        self._player_temp = None
+        self._playing_idx = -1
         self._spinner_running = False
         self._spinner_index = 0
         self._spinner_text = ""
@@ -511,6 +515,8 @@ class App(ctk.CTk):
         self._scroll_text.tag_configure("track_name_dim", foreground=TEXT_TER, font=("SF Pro Text", 13, "bold"))
         self._scroll_text.tag_configure("track_sub", foreground=TEXT_TER, font=("SF Pro Text", 11))
         self._scroll_text.tag_configure("track_sub_dim", foreground=SURFACE_3, font=("SF Pro Text", 11))
+        self._scroll_text.tag_configure("play_btn", foreground=GREEN, font=("SF Pro Text", 14))
+        self._scroll_text.tag_configure("stop_btn", foreground=PINK, font=("SF Pro Text", 14))
         self._scroll_text.tag_configure("spacer", font=("SF Pro Text", 6))
         self._scroll_text.tag_configure("empty_msg", foreground=TEXT_TER, font=("SF Pro Text", 13), justify="center")
 
@@ -569,6 +575,7 @@ class App(ctk.CTk):
         self._scroll_text.configure(state="disabled")
 
     def clear_preview(self):
+        self._stop_player()
         self._scroll_text.configure(state="normal")
         self._scroll_text.delete("1.0", "end")
         self._scroll_text.configure(state="disabled")
@@ -611,6 +618,83 @@ class App(ctk.CTk):
             self._scroll_text.tag_remove("track_sub_dim", r[0], r[1])
             self._scroll_text.tag_add("track_sub" if selected else "track_sub_dim", r[0], r[1])
 
+        self._scroll_text.configure(state="disabled")
+
+    # --- Mini player ---
+    def _play_track(self, idx):
+        if self._playing_idx == idx:
+            self._stop_player()
+            return
+        self._stop_player()
+
+        td = self._track_data[idx]
+        zip_path = td["zip_path"]
+        track_file = td["file"]
+
+        try:
+            with zipfile.ZipFile(zip_path, "r") as zf:
+                # Find the matching member (may be in a subdirectory)
+                member = None
+                for name in zf.namelist():
+                    if os.path.basename(name) == track_file:
+                        member = name
+                        break
+                if not member:
+                    return
+
+                ext = os.path.splitext(track_file)[1]
+                tmp = tempfile.NamedTemporaryFile(suffix=ext, delete=False)
+                tmp.write(zf.read(member))
+                tmp.close()
+                self._player_temp = tmp.name
+
+            self._player_proc = subprocess.Popen(
+                ["afplay", self._player_temp],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+            self._playing_idx = idx
+            self._update_play_btn(idx, playing=True)
+            self._poll_player()
+        except Exception:
+            self._stop_player()
+
+    def _stop_player(self):
+        prev = self._playing_idx
+        if self._player_proc:
+            self._player_proc.terminate()
+            self._player_proc = None
+        if self._player_temp and os.path.exists(self._player_temp):
+            os.unlink(self._player_temp)
+            self._player_temp = None
+        self._playing_idx = -1
+        if prev >= 0:
+            self._update_play_btn(prev, playing=False)
+
+    def _poll_player(self):
+        if self._player_proc and self._player_proc.poll() is not None:
+            idx = self._playing_idx
+            self._player_proc = None
+            if self._player_temp and os.path.exists(self._player_temp):
+                os.unlink(self._player_temp)
+                self._player_temp = None
+            self._playing_idx = -1
+            if idx >= 0:
+                self._update_play_btn(idx, playing=False)
+            return
+        if self._player_proc:
+            self.after(300, self._poll_player)
+
+    def _update_play_btn(self, idx, playing):
+        play_tag = f"play_{idx}"
+        self._scroll_text.configure(state="normal")
+        r = self._scroll_text.tag_ranges(play_tag)
+        if r:
+            self._scroll_text.delete(r[0], r[1])
+            if playing:
+                self._scroll_text.insert(r[0], " \u25A0 ", (play_tag, "stop_btn"))
+            else:
+                self._scroll_text.insert(r[0], " \u25B6 ", (play_tag, "play_btn"))
+            self._scroll_text.tag_bind(play_tag, "<Button-1>", lambda e, i=idx: self._play_track(i))
         self._scroll_text.configure(state="disabled")
 
     def start_analyze(self):
@@ -678,9 +762,12 @@ class App(ctk.CTk):
                 name_tag = f"name_{tid}"
                 sub_tag = f"sub_{tid}"
 
+                play_tag = f"play_{tid}"
+
                 self._track_data.append({
                     "name": name,
                     "file": fname,
+                    "zip_path": info["zip_path"],
                     "zip_name": info["zip_name"],
                     "selected": True,
                 })
@@ -688,6 +775,10 @@ class App(ctk.CTk):
                 # Checkbox
                 self._scroll_text.insert("end", CB_CHECKED, (cb_tag, "cb_on"))
                 self._scroll_text.tag_bind(cb_tag, "<Button-1>", lambda e, i=tid: self._toggle_track(i))
+
+                # Play button
+                self._scroll_text.insert("end", " \u25B6 ", (play_tag, "play_btn"))
+                self._scroll_text.tag_bind(play_tag, "<Button-1>", lambda e, i=tid: self._play_track(i))
 
                 # Cover thumbnail
                 if cover_data:
@@ -767,4 +858,5 @@ class App(ctk.CTk):
 
 if __name__ == "__main__":
     app = App()
+    app.protocol("WM_DELETE_WINDOW", lambda: (app._stop_player(), app.destroy()))
     app.mainloop()
